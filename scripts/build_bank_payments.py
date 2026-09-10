@@ -33,6 +33,7 @@ BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 HDR_FILL = PatternFill("solid", fgColor="1F4E79")
 HDR_FONT = Font(bold=True, color="FFFFFF")
 TOTAL_FILL = PatternFill("solid", fgColor="FFF2CC")
+BAND_FILL = PatternFill("solid", fgColor="F2F2F2")
 GRAY = Font(size=9, color="808080")
 NUM = "#,##0_);[Red]\\(#,##0\\)"
 
@@ -103,6 +104,38 @@ def main():
         d["note"] = d["note"] or it["note"]
         d["media"] = d["media"] or it["media"]
 
+    # 支払先ごとの使用科目（実績のある科目。実績が無ければ元シートの科目行）
+    used, listed = {}, {}
+    for it in items:
+        k = norm(it["payee"])
+        for d, ok in ((listed, True), (used, any(it["amounts"].values()))):
+            if ok:
+                d.setdefault(k, [])
+                if it["account"] not in d[k]:
+                    d[k].append(it["account"])
+    for k in listed:
+        used.setdefault(k, listed[k])
+
+    # 勘定科目は使用頻度の高い順に左から並べる（未使用は元の順で右端へ）
+    freq, gross = {}, {}
+    for it in items:
+        n = sum(1 for v in it["amounts"].values() if v)
+        if n:
+            freq[it["account"]] = freq.get(it["account"], 0) + n
+            gross[it["account"]] = gross.get(it["account"], 0) + sum(
+                v for v in it["amounts"].values() if v)
+    base = {a: i for i, a in enumerate(ACCOUNTS)}
+    ACCOUNTS.sort(key=lambda a: (0 if freq.get(a) else 1, -freq.get(a, 0),
+                                 -gross.get(a, 0), base[a]))
+
+    # 単一科目の支払先は科目ごとにまとめ、複数科目の支払先は後ろへ
+    seen = {k: i for i, k in enumerate(payees)}
+    payees.sort(key=lambda k: (0 if len(used[k]) == 1 else 1,
+                               ACCOUNTS.index(used[k][0]) if len(used[k]) == 1 else 0,
+                               seen[k]))
+    for k in payees:
+        info[k]["group"] = used[k][0] if len(used[k]) == 1 else "複数科目"
+
     amount = {}
     for it in items:
         for m, v in it["amounts"].items():
@@ -115,10 +148,18 @@ def main():
     HDR_ROW, FIRST_ROW = 2, 3
     LAST_ROW = FIRST_ROW + n_pay - 1
     TOTAL_ROW = LAST_ROW + 1
-    FIRST_COL = 2                      # B列＝最初の勘定科目
+    SUM_COL = 2                        # B列＝合計（左端に固定表示）
+    FIRST_COL = 3                      # C列＝最初の勘定科目
     LAST_COL = FIRST_COL + n_acc - 1
-    SUM_COL = LAST_COL + 1             # 合計
-    NOTE_COL = SUM_COL + 1             # 備考
+    NOTE_COL = LAST_COL + 1            # 備考
+
+    # 単一科目グループの区切りが分かるよう、1グループおきに支払先セルへ薄い帯
+    band, flip, prev = [], False, None
+    for k in payees:
+        g = info[k]["group"]
+        if g != prev:
+            flip, prev = not flip, g
+        band.append(flip)
 
     for name, new in (("みずほ銀行", "原本_みずほ銀行"), ("武蔵野銀行", "原本_武蔵野銀行")):
         wb[name].title = new
@@ -127,19 +168,20 @@ def main():
     # ---------------- 支払先マスタ ----------------
     mst = wb.create_sheet(MASTER)
     mst.cell(1, 1, "支払先マスタ（ここに追記すると全ての月シートに行が増えます）").font = Font(bold=True, size=12)
-    for i, h in enumerate(["支払先", "銀行（参考）", "備考", "媒体"], 1):
+    for i, h in enumerate(["支払先", "勘定科目（区分）", "銀行（参考）", "備考", "媒体"], 1):
         style_header(mst.cell(2, i, h))
     for i, k in enumerate(payees):
         r = 3 + i
         d = info[k]
         mst.cell(r, 1, d["name"])
-        mst.cell(r, 2, "／".join(d["paid"] or d["banks"]))
-        mst.cell(r, 3, d["note"])
-        mst.cell(r, 4, d["media"])
+        mst.cell(r, 2, d["group"])
+        mst.cell(r, 3, "／".join(d["paid"] or d["banks"]))
+        mst.cell(r, 4, d["note"])
+        mst.cell(r, 5, d["media"])
     for r in range(3, 3 + n_pay):
-        for c in range(1, 5):
+        for c in range(1, 6):
             mst.cell(r, c).border = BORDER
-    for col, w in [("A", 28), ("B", 22), ("C", 32), ("D", 18)]:
+    for col, w in [("A", 28), ("B", 18), ("C", 22), ("D", 32), ("E", 18)]:
         mst.column_dimensions[col].width = w
     mst.freeze_panes = "A3"
 
@@ -151,16 +193,19 @@ def main():
         ws.cell(1, FIRST_COL + 2, "※ 支払先の追加は「支払先マスタ」／科目の追加は「科目別集計」シートで行うと全月に反映されます").font = GRAY
 
         style_header(ws.cell(HDR_ROW, 1, "支払先"))
+        style_header(ws.cell(HDR_ROW, SUM_COL, "合計"))
         for j in range(n_acc):
             c = ws.cell(HDR_ROW, FIRST_COL + j, f"=IF({ACC_SHEET}!$A{3 + j}=\"\",\"\",{ACC_SHEET}!$A{3 + j})")
             style_header(c, wrap=True)
-        style_header(ws.cell(HDR_ROW, SUM_COL, "合計"))
         style_header(ws.cell(HDR_ROW, NOTE_COL, "備考"))
         ws.row_dimensions[HDR_ROW].height = 54
 
         for i in range(n_pay):
             r = FIRST_ROW + i
-            ws.cell(r, 1, f'=IF({MASTER}!A{r}="","",{MASTER}!A{r})').border = BORDER
+            c = ws.cell(r, 1, f'=IF({MASTER}!A{r}="","",{MASTER}!A{r})')
+            c.border = BORDER
+            if i < len(payees) and band[i]:
+                c.fill = BAND_FILL
             for j in range(n_acc):
                 acc = ACCOUNTS[j] if j < len(ACCOUNTS) else None
                 v = amount.get((payees[i], acc, m)) if (i < len(payees) and acc) else None
@@ -172,7 +217,7 @@ def main():
             ws.cell(r, NOTE_COL).border = BORDER
 
         ws.cell(TOTAL_ROW, 1, "合計")
-        for col in range(FIRST_COL, SUM_COL + 1):
+        for col in [SUM_COL] + list(range(FIRST_COL, LAST_COL + 1)):
             L = get_column_letter(col)
             rng = f"{L}{FIRST_ROW}:{L}{LAST_ROW}"
             c = ws.cell(TOTAL_ROW, col, f'=IF(COUNT({rng})=0,"",SUM({rng}))')
@@ -182,9 +227,9 @@ def main():
             c.fill, c.font, c.border = TOTAL_FILL, Font(bold=True), BORDER
 
         ws.column_dimensions["A"].width = 28
+        ws.column_dimensions[get_column_letter(SUM_COL)].width = 13
         for j in range(n_acc):
             ws.column_dimensions[get_column_letter(FIRST_COL + j)].width = 11.5
-        ws.column_dimensions[get_column_letter(SUM_COL)].width = 13
         ws.column_dimensions[get_column_letter(NOTE_COL)].width = 26
         ws.freeze_panes = ws.cell(FIRST_ROW, FIRST_COL).coordinate
 
